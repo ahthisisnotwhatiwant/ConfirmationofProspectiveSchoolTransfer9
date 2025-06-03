@@ -16,6 +16,9 @@ from email import encoders
 from email.header import Header
 from email.utils import formataddr
 import re
+import json
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 PDF_TEMPLATE_PATH = "consent.pdf"
 TRANSFER_FORM_PATH = "transfer.pdf"
@@ -28,6 +31,72 @@ MAIL_FROM = os.getenv("MAIL_FROM")
 MAIL_PASSWORD = os.getenv("MAIL_PASSWORD")
 SMTP_SERVER = os.getenv("SMTP_SERVER")
 SMTP_PORT = int(os.getenv("SMTP_PORT"))
+
+# ────────────────────────────────────────────────────────
+def init_gspread_client():
+    """
+    st.secrets["GSHEET"]["SERVICE_ACCOUNT_KEY"] 에 담긴 JSON 문자열을 파싱하여
+    OAuth2 인증을 수행하고, gspread 클라이언트를 반환합니다.
+    """
+    service_account_info = json.loads(st.secrets["GSHEET"]["SERVICE_ACCOUNT_KEY"])
+    scopes = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credentials = ServiceAccountCredentials.from_json_keyfile_dict(service_account_info, scopes)
+    client = gspread.authorize(credentials)
+    return client
+
+_gspread_client = None
+def get_gspread_client():
+    """
+    전역 변수 _gspread_client에 한 번만 init 후 반환하도록 합니다.
+    """
+    global _gspread_client
+    if _gspread_client is None:
+        _gspread_client = init_gspread_client()
+    return _gspread_client
+
+def get_worksheet():
+    """
+    get_gspread_client()를 통해 인증된 client를 얻고,
+    st.secrets["GSHEET"]["SPREADSHEET_ID"] + st.secrets["GSHEET"]["SHEET_NAME"]를 이용해
+    실제 Worksheet 객체를 리턴합니다.
+    """
+    client = get_gspread_client()
+    spreadsheet_id = st.secrets["GSHEET"]["SPREADSHEET_ID"]
+    sheet_name = st.secrets["GSHEET"].get("SHEET_NAME", "Sheet1")
+    sh = client.open_by_key(spreadsheet_id)
+    try:
+        worksheet = sh.worksheet(sheet_name)
+    except Exception:
+        worksheet = sh.get_worksheet(0)
+    return worksheet
+# ────────────────────────────────────────────────────────
+
+# ────────────────────────────────────────────────────────
+def log_submission_to_sheets(school: str, grade: str, student_name: str):
+    """
+    제출 완료 시 호출합니다.
+    [타임스탬프(한국 시간), 학교명, 학생 성명, 전학 예정 학년] 순서로 시트에 한 줄을 추가합니다.
+    """
+    try:
+        ws = get_worksheet()
+        # (1) 인자로 넘어온 grade, student_name이 비어 있으면 session_state에서 가져오도록
+        if not grade:
+            grade = st.session_state.get("next_grade_input", "")
+        if not student_name:
+            student_name = st.session_state.get("student_name", "")
+
+        # (2) 대한민국(Asia/Seoul) 로컬 시간으로 타임스탬프 생성
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
+        ws.append_row([now, school, student_name, grade])
+    except Exception as e:
+        # 시트 연결 문제 등 에러 발생 시, 사용자에게 알립니다.
+        st.error(f"구글 시트 로깅 중 오류 발생: {e}")
+# ────────────────────────────────────────────────────────
 
 try:
     favicon_image = Image.open("my_favicon.png")
@@ -103,10 +172,18 @@ if 'stage' not in st.session_state:
     st.session_state.student_birth_date = None
     st.session_state.pdf_bytes = None
     st.session_state.filename = None
+    st.session_state.next_grade_input = ""
 
-def validate_inputs(student_name, parent_name, student_school, student_birth_date, parent_phone, address, transfer_date, next_grade, move_date, relationship):
-    if not all([student_name, parent_name, student_school, student_birth_date, parent_phone, address, transfer_date, next_grade, move_date, relationship]):
+def validate_inputs(student_name, parent_name, student_school, student_birth_date,
+                    parent_phone, address, transfer_date, next_grade, move_date, relationship):
+    if not all([student_name, parent_name, student_school, student_birth_date,
+                parent_phone, address, transfer_date, next_grade, move_date, relationship]):
         return False, "모든 작성칸을 빈칸 없이 예시에 따라 작성하세요."
+
+    valid_grades = {"1학년", "2학년", "3학년", "4학년", "5학년", "6학년"}
+    if next_grade not in valid_grades:
+        return False, "전학 예정 학년을 올바르게 선택하세요."
+
     return True, ""
 
 def send_pdf_email(pdf_data, filename, recipient_email):
@@ -333,14 +410,14 @@ elif st.session_state.stage == 3:
         st.error("한글, 알파벳, 숫자, 기호로만 작성하세요.")
         address = ""
 
-    # 신규 추가: (전학) 전학 예정일
+    # (전학) 전학 예정일
     transfer_date = st.date_input(
         "전학 예정일",
         value=None,
         key="transfer_date_input"   # 키를 새로 지정
     )
 
-    # (전학) 전학 예정 학교 (disabled)
+    # (전학) 전학 예정 학교
     school_name = st.text_input(
         "전학 예정 학교",
         value=st.session_state.selected_school,
@@ -348,16 +425,20 @@ elif st.session_state.stage == 3:
     )
 
     # (전학) 전학 예정 학년
-    next_grade = st.selectbox(
+    next_grade_raw = st.text_input(
         "전학 예정 학년",
-        options=["1학년", "2학년", "3학년", "4학년", "5학년", "6학년"],
-        index=None,
-        placeholder="학년을 선택하세요.",
-        key="next_grade_input"
+        placeholder="예) 3학년 → 3 / 숫자만 입력",
+        key="next_grade_num_input"
     )
+    if next_grade_raw:
+        if re.fullmatch(r"[1-6]", next_grade_raw):
+            next_grade = f"{next_grade_raw}학년"
+        else:
+            st.error("1~6 사이의 숫자만 입력하세요.")
+            next_grade = ""
+    else:
+        next_grade = ""
 
-    # ────────────────────────────────────────────────────────
-    # 서명 부분 (변경 없음)
     col1, col2 = st.columns(2)
     with col1:
         st.write("학생 서명")
@@ -382,8 +463,6 @@ elif st.session_state.stage == 3:
             key="parent_sign_canvas"
         )
 
-    # ────────────────────────────────────────────────────────
-    # 다음 단계 전 검증: transfer_date(전학 예정일) 인자를 validate_inputs에 추가
     if st.button("✒️다음 단계로"):
         valid, error = validate_inputs(
             st.session_state.student_name,
@@ -392,7 +471,7 @@ elif st.session_state.stage == 3:
             st.session_state.student_birth_date,
             parent_phone,
             address,
-            transfer_date,       # 전학 예정일
+            transfer_date,    
             next_grade,
             st.session_state.move_date,
             relationship
@@ -400,6 +479,9 @@ elif st.session_state.stage == 3:
         if not valid:
             st.error(error)
             st.stop()
+
+        st.session_state.next_grade_input = next_grade
+        
         try:
             def calculate_signature_coverage(image_data):
                 alpha_channel = image_data[:, :, 3]
@@ -576,6 +658,11 @@ elif st.session_state.stage == 4:
                         selected_school_email = email_series.values[0]
                         if send_pdf_email(st.session_state.pdf_bytes, st.session_state.filename, selected_school_email):
                             st.success("정상적으로 제출되었습니다. 협조해 주셔서 감사합니다.")
+                            log_submission_to_sheets(
+                                st.session_state.selected_school,
+                                st.session_state.next_grade_input,
+                                st.session_state.student_name
+                            )
                             clear_session_state()
                         else:
                             st.error("오류가 발생했습니다. 다시 처음부터 진행해주세요.")
